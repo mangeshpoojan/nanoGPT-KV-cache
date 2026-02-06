@@ -4,6 +4,7 @@ Sample from a trained model
 import os
 import pickle
 from contextlib import nullcontext
+import time
 import torch
 import tiktoken
 from model import GPTConfig, GPT
@@ -81,9 +82,15 @@ start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
+if 'cuda' in device:
+    torch.cuda.synchronize()
+t0 = time.time()
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
             print('---------------')
+if 'cuda' in device:
+    torch.cuda.synchronize()
+print(f"elapsed: {time.time() - t0:.3f}s")
