@@ -41,11 +41,16 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.block_size = config.block_size
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = False
+        # causal mask to ensure attention looks only left in the sequence
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                     .view(1, 1, config.block_size, config.block_size))
-        # uncomment below lines to turn on flash attention
+
+
+        # to turn on flash attention uncomment below code
+        #
         # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         # if not self.flash:
         #     print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -61,22 +66,42 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # append past key/values if provided
         if past_kv is not None:
             past_k, past_v = past_kv
-            k = torch.cat((past_k, k), dim=2) # (B, nh, T_past + T, hs)
-            v = torch.cat((past_v, v), dim=2) # (B, nh, T_past + T, hs)
+            if past_k is not None:
+                total_len = past_k.size(2) + k.size(2)
+                if total_len > self.block_size:
+                    keep = self.block_size - k.size(2)
+                    if keep > 0:
+                        past_k = past_k[:, :, -keep:, :]
+                        past_v = past_v[:, :, -keep:, :]
+                    else:
+                        past_k = None
+                        past_v = None
+                if past_k is not None:
+                    k = torch.cat((past_k, k), dim=2)
+                    v = torch.cat((past_v, v), dim=2)
+
         present = (k, v) if use_cache else None
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash and past_kv is None:
+        use_flash = self.flash and past_kv is None
+        if use_flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            past_len = 0 if past_kv is None else past_kv[0].size(2)
-            total_len = past_len + T
-            att = att.masked_fill(self.bias[:, :, past_len:past_len + T, :total_len] == 0, float('-inf'))
+            k_len = k.size(2)
+            q_len = q.size(2)
+            past_len = k_len - q_len
+            if k_len <= self.bias.size(-1):
+                mask = self.bias[:, :, past_len:past_len + q_len, :k_len]
+            else:
+                mask = torch.tril(torch.ones(q_len, k_len, device=att.device)).view(1, 1, q_len, k_len)
+            att = att.masked_fill(mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -84,7 +109,9 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y, present
+        if use_cache:
+            return y, present
+        return y
 
 class MLP(nn.Module):
 
@@ -112,11 +139,13 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, past_kv=None, use_cache=False):
-        attn_out, present = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=use_cache)
-        x = x + attn_out
-        x = x + self.mlp(self.ln_2(x))
         if use_cache:
+            attn_out, present = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=True)
+            x = x + attn_out
+            x = x + self.mlp(self.ln_2(x))
             return x, present
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -184,23 +213,40 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, past_kv=None, use_cache=False):
         device = idx.device
         b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         past_len = 0
-        if past_kv is not None:
-            assert len(past_kv) == self.config.n_layer
-            past_len = past_kv[0][0].size(2)
-        assert t + past_len <= self.config.block_size, f"Cannot forward sequence of length {t + past_len}, block size is only {self.config.block_size}"
+        if use_cache and past_kv is not None:
+            first_kv = past_kv[0]
+            if first_kv is not None:
+                past_len = first_kv[0].size(2)
+                if past_len + t > self.config.block_size:
+                    keep = self.config.block_size - t
+                    if keep <= 0:
+                        past_kv = [None] * len(self.transformer.h)
+                        past_len = 0
+                    else:
+                        trimmed = []
+                        for layer_kv in past_kv:
+                            if layer_kv is None:
+                                trimmed.append(None)
+                                continue
+                            pk, pv = layer_kv
+                            trimmed.append((pk[:, :, -keep:, :], pv[:, :, -keep:, :]))
+                        past_kv = trimmed
+                        past_len = keep
         pos = torch.arange(past_len, past_len + t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        presents = [] if use_cache else None
+        if use_cache and past_kv is None:
+            past_kv = [None] * len(self.transformer.h)
+        present_kv = [] if use_cache else None
         for i, block in enumerate(self.transformer.h):
             if use_cache:
-                layer_past = None if past_kv is None else past_kv[i]
-                x, present = block(x, past_kv=layer_past, use_cache=True)
-                presents.append(present)
+                x, present = block(x, past_kv=past_kv[i], use_cache=True)
+                present_kv.append(present)
             else:
                 x = block(x)
         x = self.transformer.ln_f(x)
@@ -215,7 +261,7 @@ class GPT(nn.Module):
             loss = None
 
         if use_cache:
-            return logits, loss, presents
+            return logits, loss, present_kv
         return logits, loss
 
     def crop_block_size(self, block_size):
@@ -228,6 +274,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+                block.attn.block_size = block_size
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -329,27 +376,21 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=False):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         past_kv = None
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             if use_cache:
                 if past_kv is None:
                     idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                    logits, _, past_kv = self(idx_cond, use_cache=True)
                 else:
                     idx_cond = idx[:, [-1]]
-                    # keep cache length bounded by block size
-                    if past_kv[0][0].size(2) >= self.config.block_size:
-                        keep = self.config.block_size - 1
-                        if keep > 0:
-                            past_kv = [(k[:, :, -keep:, :], v[:, :, -keep:, :]) for (k, v) in past_kv]
-                        else:
-                            past_kv = [(k[:, :, :0, :], v[:, :, :0, :]) for (k, v) in past_kv]
-                logits, _, past_kv = self(idx_cond, past_kv=past_kv, use_cache=True)
+                    logits, _, past_kv = self(idx_cond, past_kv=past_kv, use_cache=True)
             else:
                 # if the sequence context is growing too long we must crop it at block_size
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
